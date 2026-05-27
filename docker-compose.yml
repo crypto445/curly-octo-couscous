@@ -23,15 +23,18 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "7545:7545"    # HTTP API + git smart-HTTP
-      - "7546:7546"    # libp2p
+      - "${GITLAWB_PORT:-7545}:${GITLAWB_PORT:-7545}"    # HTTP API + git smart-HTTP
+      - "${GITLAWB_P2P_PORT:-7546}:${GITLAWB_P2P_PORT:-7546}"    # libp2p
     volumes:
       - gitlawb-data:/data
     environment:
       DATABASE_URL: postgresql://gitlawb:${POSTGRES_PASSWORD:-changeme}@postgres:5432/gitlawb
       GITLAWB_HOST: 0.0.0.0
+      GITLAWB_PORT: ${GITLAWB_PORT:-7545}
       GITLAWB_PUBLIC_URL: ${GITLAWB_PUBLIC_URL:-http://localhost:7545}
-      GITLAWB_P2P_PORT: 7546
+      GITLAWB_P2P_PORT: ${GITLAWB_P2P_PORT:-7546}
+      # Sync
+      GITLAWB_AUTO_SYNC: ${GITLAWB_AUTO_SYNC:-false}
       # On-chain PoS (optional — leave unset for local/dev)
       GITLAWB_CHAIN_RPC_URL: ${GITLAWB_CHAIN_RPC_URL:-}
       GITLAWB_CONTRACT_NODE_STAKING: ${GITLAWB_CONTRACT_NODE_STAKING:-}
