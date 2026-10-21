@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     // present; fetch signs only if the node 404s the anonymous advertisement, so
     // public fetches stay anonymous. Absent a key, public fetch still works and push
     // falls back to unsigned (v0.1 local alpha only).
-    let keypair = load_keypair();
+    let keypair = load_keypair()?;
 
     run_helper(&repo_base, keypair.as_ref())
 }
@@ -123,9 +123,11 @@ fn help_text() -> String {
          \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
-         \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
-         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
-         \x20   GITLAWB_LOG    Log filter (default: warn)\n\
+         \x20   GITLAWB_NODE       Node base URL (default: http://127.0.0.1:7545)\n\
+         \x20   GITLAWB_KEY        Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
+         \x20   GITLAWB_PROXY_DID  Present this DID instead of the local key's —\n\
+         \x20                      proxy mode: the trusted proxy re-signs with the real key\n\
+         \x20   GITLAWB_LOG        Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
          \x20   -V, --version   Print version and exit\n\
@@ -791,26 +793,36 @@ fn safe_error_body_excerpt(body: &str) -> String {
 
 // ── Keypair loading ───────────────────────────────────────────────────────────
 
-fn load_keypair() -> Option<Keypair> {
+fn load_keypair() -> Result<Option<Keypair>> {
     let key_path = resolve_key_path();
     if !key_path.exists() {
         tracing::debug!("no keypair found at {key_path:?}");
-        return None;
+        return Ok(None);
     }
     match std::fs::read_to_string(&key_path) {
         Ok(pem) => match Keypair::from_pem(&pem) {
             Ok(kp) => {
-                tracing::debug!("loaded keypair — DID: {}", kp.did());
-                Some(kp)
+                // In proxy mode (GITLAWB_PROXY_DID set) the keypair presents the
+                // real agent DID: every signed fetch/push names it in the
+                // signature keyid, and the trusted proxy re-signs with the real
+                // private key. An invalid value is fatal, not a silent fallback.
+                let kp = gitlawb_core::identity::apply_proxy_did_from_env(kp)
+                    .context("failed to apply the public-DID override")?;
+                tracing::debug!(
+                    "loaded keypair — DID: {} (local: {})",
+                    kp.did(),
+                    kp.local_did()
+                );
+                Ok(Some(kp))
             }
             Err(e) => {
                 tracing::warn!("failed to parse keypair at {key_path:?}: {e}");
-                None
+                Ok(None)
             }
         },
         Err(e) => {
             tracing::warn!("failed to read {key_path:?}: {e}");
-            None
+            Ok(None)
         }
     }
 }
@@ -1336,6 +1348,73 @@ mod tests {
             "a direct signed advertisement must verify under the node's own chain and \
              resolve to {expected_did}, or the refusal test's empty slot proves \
              nothing; recorded verdict: {verdict:?}"
+        );
+        route.assert();
+    }
+
+    /// Proxy mode (`GITLAWB_PROXY_DID`, applied by `load_keypair`): the box signs
+    /// with a disposable local key, so what goes on the wire is a signature whose
+    /// `keyid` names the REAL agent DID while the signature bytes come from the
+    /// local key. Assert exactly that split — the keyid is what the trusted proxy
+    /// keys its re-signing on, and a signature that verified locally would mean
+    /// the override never took.
+    #[test]
+    fn proxy_mode_advertisement_names_the_real_did_in_keyid() {
+        use gitlawb_core::did::Did;
+
+        let kp = Keypair::generate();
+        let real: Did = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL"
+            .parse()
+            .unwrap();
+        let overridden = kp.with_public_did(real.clone());
+        let client = build_http_client().unwrap();
+
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String, String)>));
+        let recorder = slot.clone();
+        let mut node = mockito::Server::new();
+        let route = node
+            .mock("GET", "/zOwner/myrepo/info/refs?service=git-receive-pack")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                *recorder.lock().unwrap() = Some((
+                    received_header(req, "signature-input"),
+                    received_header(req, "signature"),
+                    received_header(req, "content-digest"),
+                ));
+                Vec::new()
+            })
+            .expect(1)
+            .create();
+
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-receive-pack",
+            node.url()
+        );
+        let resp = build_advertisement_request(&client, &refs_url, Some(&overridden))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let (sig_input, sig_header, content_digest) =
+            slot.lock().unwrap().take().expect("request captured");
+        let sig = gitlawb_core::http_sig::HttpSignature::parse(&sig_input, &sig_header).unwrap();
+        assert_eq!(
+            sig.key_id, real,
+            "the keyid must name the presented (real) DID for the proxy to re-sign as"
+        );
+        assert!(
+            node_verifies(
+                "GET",
+                "/zOwner/myrepo/info/refs?service=git-receive-pack",
+                b"",
+                &sig_input,
+                &sig_header,
+                &content_digest,
+            )
+            .is_err(),
+            "the local key's signature must NOT verify under the real DID's key: the \
+             trusted proxy is what replaces it, and a verifying signature here would \
+             mean the private key left the proxy"
         );
         route.assert();
     }

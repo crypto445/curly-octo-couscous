@@ -206,8 +206,9 @@ enum PinsPanel {
 /// dashboard can distinguish "no identity at all" from "an explicit `--dir` that
 /// could not be loaded".
 enum PinsAuth {
-    /// A usable keypair; the read will be signed.
-    Keyed(Keypair),
+    /// A usable keypair; the read will be signed. Boxed: `Keypair` is large
+    /// (clippy::large_enum_variant) and this enum only ever holds one.
+    Keyed(Box<Keypair>),
     /// No identity requested and none in the default keystore.
     Anonymous,
     /// An explicit `--dir` was given but held no usable identity (carries the dir).
@@ -221,7 +222,7 @@ enum PinsAuth {
 /// degrades quietly to `Anonymous`.
 fn resolve_pins_auth(dir: Option<&std::path::Path>) -> PinsAuth {
     match load_keypair_from_dir(dir) {
-        Ok(kp) => PinsAuth::Keyed(kp),
+        Ok(kp) => PinsAuth::Keyed(Box::new(kp)),
         Err(_) => match dir {
             Some(d) => PinsAuth::DirUnusable(d.to_path_buf()),
             None => PinsAuth::Anonymous,
@@ -240,7 +241,7 @@ async fn fetch_pins(node: &str, auth: PinsAuth) -> PinsPanel {
         PinsAuth::Anonymous => return PinsPanel::NeedsIdentity,
         PinsAuth::DirUnusable(dir) => return PinsPanel::IdentityError(dir),
     };
-    let client = NodeClient::new(node, Some(kp));
+    let client = NodeClient::new(node, Some(*kp));
     let resp = match client.get_signed("/api/v1/ipfs/pins").await {
         Ok(r) => r,
         Err(_) => return PinsPanel::Unavailable,
@@ -535,7 +536,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
         match panel {
             PinsPanel::Pins(count) => assert_eq!(count, 1),
             other => panic!("expected Pins, got {other:?}"),
@@ -558,7 +559,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
         assert!(
             matches!(panel, PinsPanel::Empty),
             "expected Empty, got {panel:?}"
@@ -583,7 +584,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "expected Unavailable, got {panel:?}"
@@ -628,7 +629,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "malformed body -> Unavailable, got {panel:?}"
@@ -647,7 +648,11 @@ mod tests {
         };
         let kp = Keypair::generate();
 
-        let panel = fetch_pins(&format!("http://127.0.0.1:{port}"), PinsAuth::Keyed(kp)).await;
+        let panel = fetch_pins(
+            &format!("http://127.0.0.1:{port}"),
+            PinsAuth::Keyed(Box::new(kp)),
+        )
+        .await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "transport error -> Unavailable, got {panel:?}"

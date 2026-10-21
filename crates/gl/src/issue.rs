@@ -177,20 +177,27 @@ async fn cmd_create(
         "status": "open",
     });
 
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let signature = keypair.sign_b64(&payload_bytes);
-
-    let signed = json!({
-        "payload": payload,
-        "signer": did,
-        "signature": signature,
-    });
-
-    let request_body = serde_json::to_vec(&json!({
+    // In proxy mode (GITLAWB_PROXY_DID set) the local key cannot produce a
+    // payload signature that verifies as the presented (real) DID, and the node
+    // takes the author from the authenticated HTTP signature while
+    // `signed_payload` is optional — so proxy-mode requests omit it entirely
+    // instead of embedding one the node would reject. Without the override the
+    // signed payload is unchanged.
+    let mut request = json!({
         "title": title,
         "body": body,
-        "signed_payload": signed,
-    }))?;
+    });
+    if keypair.public_did_override().is_none() {
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = keypair.sign_b64(&payload_bytes);
+        request["signed_payload"] = json!({
+            "payload": payload,
+            "signer": did,
+            "signature": signature,
+        });
+    }
+
+    let request_body = serde_json::to_vec(&request)?;
 
     let client = NodeClient::new(&node, Some(keypair));
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
@@ -739,5 +746,99 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── signed_payload vs GITLAWB_PROXY_DID (proxy mode) ─────────────────
+
+    /// The issue-create route every test below posts to.
+    fn create_issue_path() -> mockito::Matcher {
+        mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string())
+    }
+
+    /// Where a test records the request body the mock received.
+    type BodySlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+    fn body_slot() -> BodySlot {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// Answer with the issue-created response `cmd_create` expects, recording
+    /// the request body into `slot` first.
+    fn body_recorder(slot: BodySlot) -> impl Fn(&mockito::Request) -> Vec<u8> {
+        move |req: &mockito::Request| {
+            *slot.lock().unwrap() =
+                Some(String::from_utf8_lossy(req.body().unwrap_or(&Vec::new())).into_owned());
+            br#"{"id":"uuid-1234","title":"Test issue"}"#.to_vec()
+        }
+    }
+
+    async fn run_create(server_url: &str, dir: &TempDir) {
+        cmd_create(
+            "myrepo".to_string(),
+            "Test issue".to_string(),
+            None,
+            server_url.to_string(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_create_embeds_signed_payload_without_proxy() {
+        let _env = crate::identity::test_env::ProxyDidEnv::set(None);
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let slot = body_slot();
+        let m = server
+            .mock("POST", create_issue_path())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(body_recorder(slot.clone()))
+            .create_async()
+            .await;
+
+        run_create(&server.url(), &dir).await;
+        m.assert_async().await;
+
+        let body = slot.lock().unwrap().take().expect("request captured");
+        assert!(
+            body.contains("signed_payload"),
+            "without the override the signed payload must be embedded, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_create_proxy_mode_omits_signed_payload() {
+        let _env =
+            crate::identity::test_env::ProxyDidEnv::set(Some(crate::identity::test_env::REAL_DID));
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let slot = body_slot();
+        let m = server
+            .mock("POST", create_issue_path())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(body_recorder(slot.clone()))
+            .create_async()
+            .await;
+
+        run_create(&server.url(), &dir).await;
+        m.assert_async().await;
+
+        let body = slot.lock().unwrap().take().expect("request captured");
+        assert!(
+            !body.contains("signed_payload"),
+            "in proxy mode the local key cannot sign as the real DID, so the \
+             optional signed_payload must be omitted, got: {body}"
+        );
+        assert!(
+            body.contains("\"title\""),
+            "the plain fields must survive, got: {body}"
+        );
     }
 }

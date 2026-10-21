@@ -81,6 +81,11 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 
 /// Load keypair from an optional directory override.
 /// Used by other modules (register, repo, mcp).
+///
+/// When `GITLAWB_PROXY_DID` is set, the keypair presents that DID instead of
+/// the one its local key derives (proxy mode): every signed request then names
+/// the real agent DID, and the trusted proxy re-signs with the real private
+/// key. Without the variable, behavior is unchanged.
 pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
     let base = if let Some(d) = dir {
         d.to_path_buf()
@@ -96,7 +101,23 @@ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
             path.display()
         )
     })?;
-    Keypair::from_pem(&pem).context("failed to load keypair from PEM")
+    let keypair = Keypair::from_pem(&pem).context("failed to load keypair from PEM")?;
+    Ok(gitlawb_core::identity::apply_proxy_did_from_env(keypair)?)
+}
+
+/// Warn when the identity presents a DID its local key does not back. Commands
+/// that cryptographically depend on the local PEM (`identity sign`,
+/// `identity export`) cannot produce real-identity output in proxy mode.
+fn warn_proxy_identity(keypair: &Keypair) {
+    if keypair.public_did_override().is_some() {
+        eprintln!(
+            "warning: {} is set: the local key backs {} ({}), so this command's \
+             output will not verify as the presented DID",
+            gitlawb_core::identity::PROXY_DID_ENV,
+            keypair.local_did(),
+            keypair.did(),
+        );
+    }
 }
 
 async fn cmd_new(dir: Option<PathBuf>, force: bool) -> Result<()> {
@@ -168,6 +189,7 @@ async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
 
 async fn cmd_export(dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair(dir)?;
+    warn_proxy_identity(&keypair);
     let did = keypair.did();
     let vk = keypair.verifying_key();
     let doc = DidDocument::new(did, &vk);
@@ -177,6 +199,7 @@ async fn cmd_export(dir: Option<PathBuf>) -> Result<()> {
 
 async fn cmd_sign(message: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair(dir)?;
+    warn_proxy_identity(&keypair);
     let sig = keypair.sign_b64(message.as_bytes());
     println!("{sig}");
     Ok(())
@@ -281,6 +304,47 @@ async fn cmd_restore_with_reader(
     println!("  From: {}", src.display());
     println!("  To:   {}", dest.display());
     Ok(())
+}
+
+/// Serialize process-global `GITLAWB_PROXY_DID` access for tests across this
+/// crate's modules (identity, issue, …): env-touching tests never race.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static PROXY_DID_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A well-formed stand-in for the agent's real DID.
+    pub(crate) const REAL_DID: &str = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL";
+
+    /// Set or clear `GITLAWB_PROXY_DID` for the guard's lifetime, restoring the
+    /// previous value on drop.
+    pub(crate) struct ProxyDidEnv {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl ProxyDidEnv {
+        pub(crate) fn set(value: Option<&str>) -> Self {
+            let lock = PROXY_DID_ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GITLAWB_PROXY_DID");
+            match value {
+                Some(v) => std::env::set_var("GITLAWB_PROXY_DID", v),
+                None => std::env::remove_var("GITLAWB_PROXY_DID"),
+            }
+            ProxyDidEnv { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for ProxyDidEnv {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_PROXY_DID", v),
+                None => std::env::remove_var("GITLAWB_PROXY_DID"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,5 +571,56 @@ mod tests {
 
         let dst_kp = load_keypair_from_dir(Some(dst_dir.path())).unwrap();
         assert_eq!(original_did, dst_kp.did());
+    }
+
+    // ── GITLAWB_PROXY_DID (proxy mode) ──────────────────────────────────
+
+    use crate::identity::test_env::{ProxyDidEnv, REAL_DID};
+
+    #[tokio::test]
+    async fn load_keypair_applies_proxy_did_env() {
+        let _env = ProxyDidEnv::set(Some(REAL_DID));
+        let dir = TempDir::new().unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+
+        let kp = load_keypair_from_dir(Some(dir.path())).unwrap();
+        assert_eq!(kp.did().to_string(), REAL_DID);
+        assert_ne!(
+            kp.local_did().to_string(),
+            REAL_DID,
+            "the presented DID must differ from the local key's DID"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_keypair_without_proxy_did_env_is_unchanged() {
+        let _env = ProxyDidEnv::set(None);
+        let dir = TempDir::new().unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+
+        let kp = load_keypair_from_dir(Some(dir.path())).unwrap();
+        assert_eq!(kp.did(), kp.local_did());
+        assert_eq!(kp.public_did_override(), None);
+    }
+
+    #[tokio::test]
+    async fn load_keypair_with_invalid_proxy_did_env_errors() {
+        let _env = ProxyDidEnv::set(Some("not-a-did"));
+        let dir = TempDir::new().unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+
+        let err = load_keypair_from_dir(Some(dir.path()))
+            .err()
+            .expect("expected the invalid GITLAWB_PROXY_DID to fail the load");
+        assert!(
+            err.to_string().contains("GITLAWB_PROXY_DID"),
+            "the error must name the offending variable, got: {err}"
+        );
     }
 }
