@@ -1,0 +1,785 @@
+commit c0d243fa2ce88ca2506ced12d15032b2606b6039
+Author: opencode-coder <opencode-coder@localhost>
+Date:   Wed Oct 21 23:49:55 2026 +0000
+
+    feat: allow a public-DID override for proxy-signed identities
+    
+    Add GITLAWB_PROXY_DID: when set, a Keypair presents that DID instead of
+    the one derived from its local PEM, while signatures stay made by the
+    local key. Deployments with a trusted signing proxy use this so a coding
+    box holds a disposable key and the proxy re-signs each request with the
+    real private key, which never leaves the proxy.
+    
+    - gitlawb-core: Keypair.public_did override + apply_proxy_did_from_env
+    - gl: override applied in load_keypair_from_dir; identity sign/export
+      warn (local PEM is not the real key); issue create omits the optional
+      signed_payload in proxy mode
+    - git-remote-gitlawb: same override for clone/fetch/push; env documented
+      in --help
+    
+    Behavior is unchanged when GITLAWB_PROXY_DID is not set.
+
+diff --git a/crates/git-remote-gitlawb/src/main.rs b/crates/git-remote-gitlawb/src/main.rs
+index 738839c..a71eaf0 100644
+--- a/crates/git-remote-gitlawb/src/main.rs
++++ b/crates/git-remote-gitlawb/src/main.rs
+@@ -73,7 +73,7 @@ fn main() -> Result<()> {
+     // present; fetch signs only if the node 404s the anonymous advertisement, so
+     // public fetches stay anonymous. Absent a key, public fetch still works and push
+     // falls back to unsigned (v0.1 local alpha only).
+-    let keypair = load_keypair();
++    let keypair = load_keypair()?;
+ 
+     run_helper(&repo_base, keypair.as_ref())
+ }
+@@ -123,9 +123,11 @@ fn help_text() -> String {
+          \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
+          \n\
+          ENVIRONMENT:\n\
+-         \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
+-         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
+-         \x20   GITLAWB_LOG    Log filter (default: warn)\n\
++         \x20   GITLAWB_NODE       Node base URL (default: http://127.0.0.1:7545)\n\
++         \x20   GITLAWB_KEY        Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
++         \x20   GITLAWB_PROXY_DID  Present this DID instead of the local key's —\n\
++         \x20                      proxy mode: the trusted proxy re-signs with the real key\n\
++         \x20   GITLAWB_LOG        Log filter (default: warn)\n\
+          \n\
+          FLAGS:\n\
+          \x20   -V, --version   Print version and exit\n\
+@@ -791,26 +793,36 @@ fn safe_error_body_excerpt(body: &str) -> String {
+ 
+ // ── Keypair loading ───────────────────────────────────────────────────────────
+ 
+-fn load_keypair() -> Option<Keypair> {
++fn load_keypair() -> Result<Option<Keypair>> {
+     let key_path = resolve_key_path();
+     if !key_path.exists() {
+         tracing::debug!("no keypair found at {key_path:?}");
+-        return None;
++        return Ok(None);
+     }
+     match std::fs::read_to_string(&key_path) {
+         Ok(pem) => match Keypair::from_pem(&pem) {
+             Ok(kp) => {
+-                tracing::debug!("loaded keypair — DID: {}", kp.did());
+-                Some(kp)
++                // In proxy mode (GITLAWB_PROXY_DID set) the keypair presents the
++                // real agent DID: every signed fetch/push names it in the
++                // signature keyid, and the trusted proxy re-signs with the real
++                // private key. An invalid value is fatal, not a silent fallback.
++                let kp = gitlawb_core::identity::apply_proxy_did_from_env(kp)
++                    .context("failed to apply the public-DID override")?;
++                tracing::debug!(
++                    "loaded keypair — DID: {} (local: {})",
++                    kp.did(),
++                    kp.local_did()
++                );
++                Ok(Some(kp))
+             }
+             Err(e) => {
+                 tracing::warn!("failed to parse keypair at {key_path:?}: {e}");
+-                None
++                Ok(None)
+             }
+         },
+         Err(e) => {
+             tracing::warn!("failed to read {key_path:?}: {e}");
+-            None
++            Ok(None)
+         }
+     }
+ }
+@@ -1340,6 +1352,73 @@ mod tests {
+         route.assert();
+     }
+ 
++    /// Proxy mode (`GITLAWB_PROXY_DID`, applied by `load_keypair`): the box signs
++    /// with a disposable local key, so what goes on the wire is a signature whose
++    /// `keyid` names the REAL agent DID while the signature bytes come from the
++    /// local key. Assert exactly that split — the keyid is what the trusted proxy
++    /// keys its re-signing on, and a signature that verified locally would mean
++    /// the override never took.
++    #[test]
++    fn proxy_mode_advertisement_names_the_real_did_in_keyid() {
++        use gitlawb_core::did::Did;
++
++        let kp = Keypair::generate();
++        let real: Did = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL"
++            .parse()
++            .unwrap();
++        let overridden = kp.with_public_did(real.clone());
++        let client = build_http_client().unwrap();
++
++        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String, String)>));
++        let recorder = slot.clone();
++        let mut node = mockito::Server::new();
++        let route = node
++            .mock("GET", "/zOwner/myrepo/info/refs?service=git-receive-pack")
++            .with_status(200)
++            .with_body_from_request(move |req| {
++                *recorder.lock().unwrap() = Some((
++                    received_header(req, "signature-input"),
++                    received_header(req, "signature"),
++                    received_header(req, "content-digest"),
++                ));
++                Vec::new()
++            })
++            .expect(1)
++            .create();
++
++        let refs_url = format!(
++            "{}/zOwner/myrepo/info/refs?service=git-receive-pack",
++            node.url()
++        );
++        let resp = build_advertisement_request(&client, &refs_url, Some(&overridden))
++            .send()
++            .unwrap();
++        assert_eq!(resp.status(), 200);
++
++        let (sig_input, sig_header, content_digest) =
++            slot.lock().unwrap().take().expect("request captured");
++        let sig = gitlawb_core::http_sig::HttpSignature::parse(&sig_input, &sig_header).unwrap();
++        assert_eq!(
++            sig.key_id, real,
++            "the keyid must name the presented (real) DID for the proxy to re-sign as"
++        );
++        assert!(
++            node_verifies(
++                "GET",
++                "/zOwner/myrepo/info/refs?service=git-receive-pack",
++                b"",
++                &sig_input,
++                &sig_header,
++                &content_digest,
++            )
++            .is_err(),
++            "the local key's signature must NOT verify under the real DID's key: the \
++             trusted proxy is what replaces it, and a verifying signature here would \
++             mean the private key left the proxy"
++        );
++        route.assert();
++    }
++
+     /// The regression that round-1 missed: the Phase-2 `git-upload-pack` POST was
+     /// left unsigned, so an owner's fetch of a private repo cleared the (now signed)
+     /// advertisement and then 404'd on the pack POST. Drive BOTH request builders
+diff --git a/crates/gitlawb-core/src/identity.rs b/crates/gitlawb-core/src/identity.rs
+index beef4d1..16838fa 100644
+--- a/crates/gitlawb-core/src/identity.rs
++++ b/crates/gitlawb-core/src/identity.rs
+@@ -2,6 +2,12 @@
+ //!
+ //! A gitlawb identity is an Ed25519 keypair. The public key encodes into a
+ //! `did:key` DID. The private key is stored as PKCS#8 PEM on disk.
++//!
++//! A keypair can carry a public-DID override ([`Keypair::with_public_did`]):
++//! the identity it PRESENTS (`did()`, signature `keyid`s, signer fields) then
++//! differs from the DID its local key derives. Proxy deployments use this so a
++//! coding box can hold a local, disposable key while a trusted proxy re-signs
++//! each request with the real private key, which never leaves the proxy.
+ 
+ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+ use rand::rngs::OsRng;
+@@ -11,23 +17,38 @@ use zeroize::Zeroizing;
+ use crate::did::Did;
+ use crate::{Error, Result};
+ 
++/// Environment variable that, when set, names the DID a box's identity should
++/// present in place of the one derived from its local PEM. Read by
++/// [`apply_proxy_did_from_env`]; a proxy deployment sets it to the agent's real
++/// DID, and the trusted proxy re-signs requests with the matching private key.
++pub const PROXY_DID_ENV: &str = "GITLAWB_PROXY_DID";
++
+ /// An Ed25519 keypair that is the root identity for a gitlawb actor.
+ #[derive(Clone)]
+ pub struct Keypair {
+     signing_key: SigningKey,
++    /// When set, `did()` reports this DID instead of the one derived from the
++    /// local signing key. Signatures are still made by the local key.
++    public_did: Option<Did>,
+ }
+ 
+ impl Keypair {
+     /// Generate a new random keypair using the OS CSPRNG.
+     pub fn generate() -> Self {
+         let signing_key = SigningKey::generate(&mut OsRng);
+-        Self { signing_key }
++        Self {
++            signing_key,
++            public_did: None,
++        }
+     }
+ 
+     /// Load a keypair from raw 32-byte seed bytes (zeroized after use).
+     pub fn from_seed(seed: &[u8; 32]) -> Result<Self> {
+         let signing_key = SigningKey::from_bytes(seed);
+-        Ok(Self { signing_key })
++        Ok(Self {
++            signing_key,
++            public_did: None,
++        })
+     }
+ 
+     /// The Ed25519 verifying (public) key.
+@@ -35,11 +56,32 @@ impl Keypair {
+         self.signing_key.verifying_key()
+     }
+ 
+-    /// The `did:key` DID derived from this keypair's public key.
++    /// The DID this identity presents: the attached public-DID override when
++    /// one is set, otherwise the `did:key` derived from the local public key.
+     pub fn did(&self) -> Did {
++        match &self.public_did {
++            Some(did) => did.clone(),
++            None => Did::from_verifying_key(&self.verifying_key()),
++        }
++    }
++
++    /// The `did:key` derived from the local signing key, ignoring any
++    /// public-DID override.
++    pub fn local_did(&self) -> Did {
+         Did::from_verifying_key(&self.verifying_key())
+     }
+ 
++    /// Attach a public-DID override, replacing any previous one. See [`PROXY_DID_ENV`].
++    pub fn with_public_did(mut self, did: Did) -> Self {
++        self.public_did = Some(did);
++        self
++    }
++
++    /// The attached public-DID override, if any.
++    pub fn public_did_override(&self) -> Option<&Did> {
++        self.public_did.as_ref()
++    }
++
+     /// Sign arbitrary bytes. Returns a 64-byte Ed25519 signature.
+     pub fn sign(&self, msg: &[u8]) -> Signature {
+         self.signing_key.sign(msg)
+@@ -72,10 +114,29 @@ impl Keypair {
+     pub fn from_pem(pem: &str) -> Result<Self> {
+         use pkcs8::DecodePrivateKey;
+         let signing_key = SigningKey::from_pkcs8_pem(pem).map_err(|e| Error::Key(e.to_string()))?;
+-        Ok(Self { signing_key })
++        Ok(Self {
++            signing_key,
++            public_did: None,
++        })
+     }
+ }
+ 
++/// Apply the [`PROXY_DID_ENV`] override to `kp`: when the variable is set to a
++/// well-formed DID, `kp` presents it instead of the DID its local key derives.
++/// Absent or empty, `kp` is returned unchanged. An invalid value is an error,
++/// never a silent fallback: a box that believes it presents one identity while
++/// the proxy signs as another produces rejections that are hard to diagnose.
++pub fn apply_proxy_did_from_env(kp: Keypair) -> Result<Keypair> {
++    let raw = match std::env::var(PROXY_DID_ENV) {
++        Ok(v) if !v.trim().is_empty() => v,
++        _ => return Ok(kp),
++    };
++    let did: Did = raw.trim().parse().map_err(|e: Error| {
++        Error::InvalidDid(format!("{PROXY_DID_ENV} is not a valid DID: {e}"))
++    })?;
++    Ok(kp.with_public_did(did))
++}
++
+ /// Verify an Ed25519 signature.
+ pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
+     let sig = Signature::from_bytes(sig_bytes);
+@@ -256,4 +317,108 @@ mod tests {
+         let result = Keypair::from_pem("this is not valid PEM at all");
+         assert!(result.is_err());
+     }
++
++    // ── public-DID override (proxy mode) ─────────────────────────────────
++
++    #[test]
++    fn public_did_override_changes_presented_did_only() {
++        let kp = Keypair::generate();
++        let local = kp.did();
++        let real: Did = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL"
++            .parse()
++            .unwrap();
++
++        let overridden = kp.clone().with_public_did(real.clone());
++        assert_eq!(overridden.did(), real);
++        assert_eq!(overridden.public_did_override(), Some(&real));
++        assert_eq!(overridden.local_did(), local, "local DID must not move");
++        assert_eq!(
++            overridden.verifying_key(),
++            kp.verifying_key(),
++            "the signing key must not move"
++        );
++        assert_eq!(kp.public_did_override(), None);
++    }
++
++    #[test]
++    fn sign_request_keyid_uses_the_override() {
++        let kp = Keypair::generate();
++        let real: Did = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL"
++            .parse()
++            .unwrap();
++        let overridden = kp.with_public_did(real.clone());
++
++        let headers = crate::http_sig::sign_request(&overridden, "POST", "/api/x", b"{}");
++        let sig =
++            crate::http_sig::HttpSignature::parse(&headers.signature_input, &headers.signature)
++                .unwrap();
++        assert_eq!(
++            sig.key_id, real,
++            "the signature's keyid must name the presented (real) DID"
++        );
++    }
++
++    /// Serializes the `apply_proxy_did_from_env` tests: they read and write the
++    /// process-global `GITLAWB_PROXY_DID` variable and must not race.
++    static PROXY_DID_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
++    /// Set `GITLAWB_PROXY_DID` for the guard's lifetime, restoring the previous
++    /// value (or its absence) on drop.
++    struct ProxyDidEnv(Option<std::ffi::OsString>);
++
++    impl ProxyDidEnv {
++        fn set(value: &str) -> Self {
++            let _lock = PROXY_DID_ENV_LOCK.lock().unwrap();
++            let prev = std::env::var_os(PROXY_DID_ENV);
++            std::env::set_var(PROXY_DID_ENV, value);
++            ProxyDidEnv(prev)
++        }
++        fn unset() -> Self {
++            let _lock = PROXY_DID_ENV_LOCK.lock().unwrap();
++            let prev = std::env::var_os(PROXY_DID_ENV);
++            std::env::remove_var(PROXY_DID_ENV);
++            ProxyDidEnv(prev)
++        }
++    }
++
++    impl Drop for ProxyDidEnv {
++        fn drop(&mut self) {
++            let _lock = PROXY_DID_ENV_LOCK.lock().unwrap();
++            match self.0.take() {
++                Some(v) => std::env::set_var(PROXY_DID_ENV, v),
++                None => std::env::remove_var(PROXY_DID_ENV),
++            }
++        }
++    }
++
++    #[test]
++    fn env_override_applied_when_set() {
++        let _env = ProxyDidEnv::set("did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL");
++        let kp = apply_proxy_did_from_env(Keypair::generate()).unwrap();
++        assert_eq!(
++            kp.did().to_string(),
++            "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL"
++        );
++    }
++
++    #[test]
++    fn env_override_ignored_when_unset_or_empty() {
++        {
++            let _env = ProxyDidEnv::unset();
++            let kp = apply_proxy_did_from_env(Keypair::generate()).unwrap();
++            assert_eq!(kp.public_did_override(), None);
++        }
++        let _env = ProxyDidEnv::set("   ");
++        let kp = apply_proxy_did_from_env(Keypair::generate()).unwrap();
++        assert_eq!(kp.public_did_override(), None);
++    }
++
++    #[test]
++    fn env_override_invalid_value_is_an_error() {
++        let _env = ProxyDidEnv::set("not-a-did");
++        let err = apply_proxy_did_from_env(Keypair::generate())
++            .err()
++            .expect("expected the invalid GITLAWB_PROXY_DID to be rejected");
++        assert!(err.to_string().contains(PROXY_DID_ENV));
++    }
+ }
+diff --git a/crates/gl/src/identity.rs b/crates/gl/src/identity.rs
+index bde5c94..9b9e5b9 100644
+--- a/crates/gl/src/identity.rs
++++ b/crates/gl/src/identity.rs
+@@ -81,6 +81,11 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
+ 
+ /// Load keypair from an optional directory override.
+ /// Used by other modules (register, repo, mcp).
++///
++/// When `GITLAWB_PROXY_DID` is set, the keypair presents that DID instead of
++/// the one its local key derives (proxy mode): every signed request then names
++/// the real agent DID, and the trusted proxy re-signs with the real private
++/// key. Without the variable, behavior is unchanged.
+ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
+     let base = if let Some(d) = dir {
+         d.to_path_buf()
+@@ -96,7 +101,23 @@ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
+             path.display()
+         )
+     })?;
+-    Keypair::from_pem(&pem).context("failed to load keypair from PEM")
++    let keypair = Keypair::from_pem(&pem).context("failed to load keypair from PEM")?;
++    Ok(gitlawb_core::identity::apply_proxy_did_from_env(keypair)?)
++}
++
++/// Warn when the identity presents a DID its local key does not back. Commands
++/// that cryptographically depend on the local PEM (`identity sign`,
++/// `identity export`) cannot produce real-identity output in proxy mode.
++fn warn_proxy_identity(keypair: &Keypair) {
++    if keypair.public_did_override().is_some() {
++        eprintln!(
++            "warning: {} is set: the local key backs {} ({}), so this command's \
++             output will not verify as the presented DID",
++            gitlawb_core::identity::PROXY_DID_ENV,
++            keypair.local_did(),
++            keypair.did(),
++        );
++    }
+ }
+ 
+ async fn cmd_new(dir: Option<PathBuf>, force: bool) -> Result<()> {
+@@ -168,6 +189,7 @@ async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
+ 
+ async fn cmd_export(dir: Option<PathBuf>) -> Result<()> {
+     let keypair = load_keypair(dir)?;
++    warn_proxy_identity(&keypair);
+     let did = keypair.did();
+     let vk = keypair.verifying_key();
+     let doc = DidDocument::new(did, &vk);
+@@ -177,6 +199,7 @@ async fn cmd_export(dir: Option<PathBuf>) -> Result<()> {
+ 
+ async fn cmd_sign(message: String, dir: Option<PathBuf>) -> Result<()> {
+     let keypair = load_keypair(dir)?;
++    warn_proxy_identity(&keypair);
+     let sig = keypair.sign_b64(message.as_bytes());
+     println!("{sig}");
+     Ok(())
+@@ -283,6 +306,47 @@ async fn cmd_restore_with_reader(
+     Ok(())
+ }
+ 
++/// Serialize process-global `GITLAWB_PROXY_DID` access for tests across this
++/// crate's modules (identity, issue, …): env-touching tests never race.
++#[cfg(test)]
++pub(crate) mod test_env {
++    use std::ffi::OsString;
++    use std::sync::{Mutex, MutexGuard};
++
++    static PROXY_DID_ENV_LOCK: Mutex<()> = Mutex::new(());
++
++    /// A well-formed stand-in for the agent's real DID.
++    pub(crate) const REAL_DID: &str = "did:key:z6MkgKE7i43aWhq2ntFx5o7e2tXrSZFay1nY4KZAuyj5WofL";
++
++    /// Set or clear `GITLAWB_PROXY_DID` for the guard's lifetime, restoring the
++    /// previous value on drop.
++    pub(crate) struct ProxyDidEnv {
++        _lock: MutexGuard<'static, ()>,
++        prev: Option<OsString>,
++    }
++
++    impl ProxyDidEnv {
++        pub(crate) fn set(value: Option<&str>) -> Self {
++            let lock = PROXY_DID_ENV_LOCK.lock().unwrap();
++            let prev = std::env::var_os("GITLAWB_PROXY_DID");
++            match value {
++                Some(v) => std::env::set_var("GITLAWB_PROXY_DID", v),
++                None => std::env::remove_var("GITLAWB_PROXY_DID"),
++            }
++            ProxyDidEnv { _lock: lock, prev }
++        }
++    }
++
++    impl Drop for ProxyDidEnv {
++        fn drop(&mut self) {
++            match self.prev.take() {
++                Some(v) => std::env::set_var("GITLAWB_PROXY_DID", v),
++                None => std::env::remove_var("GITLAWB_PROXY_DID"),
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -508,4 +572,55 @@ mod tests {
+         let dst_kp = load_keypair_from_dir(Some(dst_dir.path())).unwrap();
+         assert_eq!(original_did, dst_kp.did());
+     }
++
++    // ── GITLAWB_PROXY_DID (proxy mode) ──────────────────────────────────
++
++    use crate::identity::test_env::{ProxyDidEnv, REAL_DID};
++
++    #[tokio::test]
++    async fn load_keypair_applies_proxy_did_env() {
++        let _env = ProxyDidEnv::set(Some(REAL_DID));
++        let dir = TempDir::new().unwrap();
++        cmd_new(Some(dir.path().to_path_buf()), false)
++            .await
++            .unwrap();
++
++        let kp = load_keypair_from_dir(Some(dir.path())).unwrap();
++        assert_eq!(kp.did().to_string(), REAL_DID);
++        assert_ne!(
++            kp.local_did().to_string(),
++            REAL_DID,
++            "the presented DID must differ from the local key's DID"
++        );
++    }
++
++    #[tokio::test]
++    async fn load_keypair_without_proxy_did_env_is_unchanged() {
++        let _env = ProxyDidEnv::set(None);
++        let dir = TempDir::new().unwrap();
++        cmd_new(Some(dir.path().to_path_buf()), false)
++            .await
++            .unwrap();
++
++        let kp = load_keypair_from_dir(Some(dir.path())).unwrap();
++        assert_eq!(kp.did(), kp.local_did());
++        assert_eq!(kp.public_did_override(), None);
++    }
++
++    #[tokio::test]
++    async fn load_keypair_with_invalid_proxy_did_env_errors() {
++        let _env = ProxyDidEnv::set(Some("not-a-did"));
++        let dir = TempDir::new().unwrap();
++        cmd_new(Some(dir.path().to_path_buf()), false)
++            .await
++            .unwrap();
++
++        let err = load_keypair_from_dir(Some(dir.path()))
++            .err()
++            .expect("expected the invalid GITLAWB_PROXY_DID to fail the load");
++        assert!(
++            err.to_string().contains("GITLAWB_PROXY_DID"),
++            "the error must name the offending variable, got: {err}"
++        );
++    }
+ }
+diff --git a/crates/gl/src/issue.rs b/crates/gl/src/issue.rs
+index 57bd694..e88d63e 100644
+--- a/crates/gl/src/issue.rs
++++ b/crates/gl/src/issue.rs
+@@ -177,20 +177,27 @@ async fn cmd_create(
+         "status": "open",
+     });
+ 
+-    let payload_bytes = serde_json::to_vec(&payload)?;
+-    let signature = keypair.sign_b64(&payload_bytes);
+-
+-    let signed = json!({
+-        "payload": payload,
+-        "signer": did,
+-        "signature": signature,
+-    });
+-
+-    let request_body = serde_json::to_vec(&json!({
++    // In proxy mode (GITLAWB_PROXY_DID set) the local key cannot produce a
++    // payload signature that verifies as the presented (real) DID, and the node
++    // takes the author from the authenticated HTTP signature while
++    // `signed_payload` is optional — so proxy-mode requests omit it entirely
++    // instead of embedding one the node would reject. Without the override the
++    // signed payload is unchanged.
++    let mut request = json!({
+         "title": title,
+         "body": body,
+-        "signed_payload": signed,
+-    }))?;
++    });
++    if keypair.public_did_override().is_none() {
++        let payload_bytes = serde_json::to_vec(&payload)?;
++        let signature = keypair.sign_b64(&payload_bytes);
++        request["signed_payload"] = json!({
++            "payload": payload,
++            "signer": did,
++            "signature": signature,
++        });
++    }
++
++    let request_body = serde_json::to_vec(&request)?;
+ 
+     let client = NodeClient::new(&node, Some(keypair));
+     let path = format!("/api/v1/repos/{owner}/{name}/issues");
+@@ -740,4 +747,98 @@ mod tests {
+         .await
+         .unwrap();
+     }
++
++    // ── signed_payload vs GITLAWB_PROXY_DID (proxy mode) ─────────────────
++
++    /// The issue-create route every test below posts to.
++    fn create_issue_path() -> mockito::Matcher {
++        mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string())
++    }
++
++    /// Where a test records the request body the mock received.
++    type BodySlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
++
++    fn body_slot() -> BodySlot {
++        std::sync::Arc::new(std::sync::Mutex::new(None))
++    }
++
++    /// Answer with the issue-created response `cmd_create` expects, recording
++    /// the request body into `slot` first.
++    fn body_recorder(slot: BodySlot) -> impl Fn(&mockito::Request) -> Vec<u8> {
++        move |req: &mockito::Request| {
++            *slot.lock().unwrap() =
++                Some(String::from_utf8_lossy(req.body().unwrap_or(&Vec::new())).into_owned());
++            br#"{"id":"uuid-1234","title":"Test issue"}"#.to_vec()
++        }
++    }
++
++    async fn run_create(server_url: &str, dir: &TempDir) {
++        cmd_create(
++            "myrepo".to_string(),
++            "Test issue".to_string(),
++            None,
++            server_url.to_string(),
++            Some(dir.path().to_path_buf()),
++        )
++        .await
++        .unwrap();
++    }
++
++    #[tokio::test]
++    async fn test_cmd_create_embeds_signed_payload_without_proxy() {
++        let _env = crate::identity::test_env::ProxyDidEnv::set(None);
++        let dir = TempDir::new().unwrap();
++        write_identity(&dir);
++
++        let mut server = mockito::Server::new_async().await;
++        let slot = body_slot();
++        let m = server
++            .mock("POST", create_issue_path())
++            .with_status(200)
++            .with_header("content-type", "application/json")
++            .with_body_from_request(body_recorder(slot.clone()))
++            .create_async()
++            .await;
++
++        run_create(&server.url(), &dir).await;
++        m.assert_async().await;
++
++        let body = slot.lock().unwrap().take().expect("request captured");
++        assert!(
++            body.contains("signed_payload"),
++            "without the override the signed payload must be embedded, got: {body}"
++        );
++    }
++
++    #[tokio::test]
++    async fn test_cmd_create_proxy_mode_omits_signed_payload() {
++        let _env =
++            crate::identity::test_env::ProxyDidEnv::set(Some(crate::identity::test_env::REAL_DID));
++        let dir = TempDir::new().unwrap();
++        write_identity(&dir);
++
++        let mut server = mockito::Server::new_async().await;
++        let slot = body_slot();
++        let m = server
++            .mock("POST", create_issue_path())
++            .with_status(200)
++            .with_header("content-type", "application/json")
++            .with_body_from_request(body_recorder(slot.clone()))
++            .create_async()
++            .await;
++
++        run_create(&server.url(), &dir).await;
++        m.assert_async().await;
++
++        let body = slot.lock().unwrap().take().expect("request captured");
++        assert!(
++            !body.contains("signed_payload"),
++            "in proxy mode the local key cannot sign as the real DID, so the \
++             optional signed_payload must be omitted, got: {body}"
++        );
++        assert!(
++            body.contains("\"title\""),
++            "the plain fields must survive, got: {body}"
++        );
++    }
+ }
+diff --git a/crates/gl/src/node.rs b/crates/gl/src/node.rs
+index 367ba57..f36089a 100644
+--- a/crates/gl/src/node.rs
++++ b/crates/gl/src/node.rs
+@@ -206,8 +206,9 @@ enum PinsPanel {
+ /// dashboard can distinguish "no identity at all" from "an explicit `--dir` that
+ /// could not be loaded".
+ enum PinsAuth {
+-    /// A usable keypair; the read will be signed.
+-    Keyed(Keypair),
++    /// A usable keypair; the read will be signed. Boxed: `Keypair` is large
++    /// (clippy::large_enum_variant) and this enum only ever holds one.
++    Keyed(Box<Keypair>),
+     /// No identity requested and none in the default keystore.
+     Anonymous,
+     /// An explicit `--dir` was given but held no usable identity (carries the dir).
+@@ -221,7 +222,7 @@ enum PinsAuth {
+ /// degrades quietly to `Anonymous`.
+ fn resolve_pins_auth(dir: Option<&std::path::Path>) -> PinsAuth {
+     match load_keypair_from_dir(dir) {
+-        Ok(kp) => PinsAuth::Keyed(kp),
++        Ok(kp) => PinsAuth::Keyed(Box::new(kp)),
+         Err(_) => match dir {
+             Some(d) => PinsAuth::DirUnusable(d.to_path_buf()),
+             None => PinsAuth::Anonymous,
+@@ -240,7 +241,7 @@ async fn fetch_pins(node: &str, auth: PinsAuth) -> PinsPanel {
+         PinsAuth::Anonymous => return PinsPanel::NeedsIdentity,
+         PinsAuth::DirUnusable(dir) => return PinsPanel::IdentityError(dir),
+     };
+-    let client = NodeClient::new(node, Some(kp));
++    let client = NodeClient::new(node, Some(*kp));
+     let resp = match client.get_signed("/api/v1/ipfs/pins").await {
+         Ok(r) => r,
+         Err(_) => return PinsPanel::Unavailable,
+@@ -535,7 +536,7 @@ mod tests {
+             .create_async()
+             .await;
+ 
+-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
++        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
+         match panel {
+             PinsPanel::Pins(count) => assert_eq!(count, 1),
+             other => panic!("expected Pins, got {other:?}"),
+@@ -558,7 +559,7 @@ mod tests {
+             .create_async()
+             .await;
+ 
+-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
++        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
+         assert!(
+             matches!(panel, PinsPanel::Empty),
+             "expected Empty, got {panel:?}"
+@@ -583,7 +584,7 @@ mod tests {
+             .create_async()
+             .await;
+ 
+-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
++        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
+         assert!(
+             matches!(panel, PinsPanel::Unavailable),
+             "expected Unavailable, got {panel:?}"
+@@ -628,7 +629,7 @@ mod tests {
+             .create_async()
+             .await;
+ 
+-        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
++        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(Box::new(kp))).await;
+         assert!(
+             matches!(panel, PinsPanel::Unavailable),
+             "malformed body -> Unavailable, got {panel:?}"
+@@ -647,7 +648,11 @@ mod tests {
+         };
+         let kp = Keypair::generate();
+ 
+-        let panel = fetch_pins(&format!("http://127.0.0.1:{port}"), PinsAuth::Keyed(kp)).await;
++        let panel = fetch_pins(
++            &format!("http://127.0.0.1:{port}"),
++            PinsAuth::Keyed(Box::new(kp)),
++        )
++        .await;
+         assert!(
+             matches!(panel, PinsPanel::Unavailable),
+             "transport error -> Unavailable, got {panel:?}"
