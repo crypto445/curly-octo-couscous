@@ -1,0 +1,53 @@
+TODO — gl CLI: coerenza identità locale / proxy (proxy mode)
+=============================================================
+
+Contesto
+--------
+Con GITLAWB_PROXY_DID attivo il CLI presenta il DID del proxy, ma firma e
+verifica localmente con la chiave in ~/.gitlawb/identity.pem. Il DID proxy
+è una maschera di presentazione: la chiave privata corrispondente resta
+sul proxy e il PEM non può mai "diventare" quel DID. L'architettura è
+sana; è l'output dei comandi che nasconde la dualità e confonde.
+
+Fix proposti (crates/gl/src/identity.rs + crates/gl/src/doctor.rs)
+------------------------------------------------------------------
+1. identity new — dual print                                   [~10 righe]
+   In proxy mode: stampare il nuovo DID locale + nota esplicita
+   ("l'identità effettiva resta quella del proxy; questa chiave firma
+   solo localmente"). Riutilizzare il pattern warn_proxy_identity già
+   usato da sign/export. Punto: cmd_new_with_reader.
+
+2. identity show — dual view                                   [~15 righe]
+   Con override attivo mostrare ENTRAMBI:
+     Effective: <DID proxy>   (da GITLAWB_PROXY_DID)
+     Local:      <DID derivato dal PEM>
+   Oggi mostra solo il proxy e nasconde la chiave locale. Punto: cmd_show.
+
+3. identity new — no overwrite silenzioso                      [~10 righe]
+   Se identity.pem esiste già: richiedere --force o fare auto-backup
+   .bak. Il PEM è l'unica copia dell'identità locale.
+
+4. doctor — etichettare le due identità                        [~10 righe]
+   "Identity (local key): … / Effective (proxy): … / Registration:
+   ucan.json -> node". Oggi mescola locale e proxy senza dichiararlo.
+
+5. identity export — documento onesto                          [~5 righe]
+   In proxy mode: esportare il documento del DID locale, o rifiutare
+   con spiegazione (DID proxy + chiave locale non verificherà mai).
+
+Da NON fare
+-----------
+Sovrascrivere il DID di identity new con quello dell'env: nasconderebbe
+l'unico DID con cui le firme locali verificano, e farebbe credere che il
+PEM possegga l'identità del proxy (falso: la chiave privata è del proxy).
+
+Altro in sospeso (test CLI su nodo proxy)
+-----------------------------------------
+- gl mcp serve (JSON-RPC stdin/stdout: initialize, tools/list, tool exec)
+- visibility set/remove/list + clone
+- mirror GitHub (gl mirror <url>)
+- gl ucan show/verify
+- task create/claim/complete, bounty (attesi fallire senza stake)
+
+Ordine consigliato: 1 -> 2 -> 3 -> 4 -> 5; dopo ogni fix rebuild release
+e verifica con --dir pulito, env on/off.
